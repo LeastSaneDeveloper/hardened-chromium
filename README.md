@@ -1,2 +1,2 @@
 # hardened-chromium
-Hardened Chromium
+Hardened Chromium security and somewhat privacy wise
