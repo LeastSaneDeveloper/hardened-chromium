@@ -1,0 +1,262 @@
+name: Build hardened_chromium for Windows
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "patches/**"
+      - ".github/workflows/build-chromium-windows.yml"
+permissions:
+  contents: read
+concurrency:
+  group: chromium-windows-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+  DEPOT_TOOLS_UPDATE: "0"
+  GCLIENT_SUPPRESS_GIT_VERSION_WARNING: "1"
+  CHROMIUM_SRC: "${{ github.workspace }}\\chromium\\src"
+  BUILD_OUTPUT: "${{ github.workspace }}\\chromium\\src\\out\\Release"
+jobs:
+  build:
+    name: Build hardened_chromium
+    runs-on: windows-2022
+    timeout-minutes: 360
+    steps:
+      - name: Checkout patches
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Configure Git
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+          git config --global fetch.parallel 8
+      - name: Install depot_tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $DepotTools = Join-Path $env:GITHUB_WORKSPACE "depot_tools"
+          if (Test-Path $DepotTools) {
+            Remove-Item -Recurse -Force $DepotTools
+          }
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $DepotTools
+          $env:PATH = "$DepotTools;$env:PATH"
+          "PATH=$DepotTools;$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if (-not (Test-Path (Join-Path $DepotTools "fetch.bat"))) {
+            throw "depot_tools installation failed."
+          }
+          Write-Host "depot_tools installed at $DepotTools"
+      - name: Fetch Chromium
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ChromiumDir = Join-Path $env:GITHUB_WORKSPACE "chromium"
+          if (Test-Path $ChromiumDir) {
+            Remove-Item -Recurse -Force $ChromiumDir
+          }
+          New-Item -ItemType Directory -Path $ChromiumDir | Out-Null
+          Push-Location $ChromiumDir
+          try {
+            fetch --no-history chromium
+          }
+          finally {
+            Pop-Location
+          }
+          if (-not (Test-Path $env:CHROMIUM_SRC)) {
+            throw "Chromium source tree was not created at $env:CHROMIUM_SRC"
+          }
+      - name: Sync dependencies
+        shell: pwsh
+        working-directory: ${{ env.CHROMIUM_SRC }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          gclient sync --no-history --nohooks
+          if ($LASTEXITCODE -ne 0) {
+            throw "gclient sync failed."
+          }
+      - name: Run hooks
+        shell: pwsh
+        working-directory: ${{ env.CHROMIUM_SRC }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          gclient runhooks
+          if ($LASTEXITCODE -ne 0) {
+            throw "Chromium hooks failed."
+          }
+      - name: Validate patch dir
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PatchRoot = Join-Path $env:GITHUB_WORKSPACE "patches"
+          if (-not (Test-Path $PatchRoot -PathType Container)) {
+            throw "Required patches directory does not exist: $PatchRoot"
+          }
+          $Patches = @(
+            Get-ChildItem `
+              -Path $PatchRoot `
+              -Recurse `
+              -File `
+              -Include *.patch,*.diff |
+            Sort-Object FullName
+          )
+          if ($Patches.Count -eq 0) {
+            throw "No .patch or .diff files were found under $PatchRoot"
+          }
+          Write-Host "Found $($Patches.Count) patch file(s):"
+          foreach ($Patch in $Patches) {
+            Write-Host "  $($Patch.FullName.Substring($PatchRoot.Length + 1))"
+          }
+      - name: Apply patches
+        shell: pwsh
+        working-directory: ${{ env.CHROMIUM_SRC }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PatchRoot = Join-Path $env:GITHUB_WORKSPACE "patches"
+          $Patches = @(
+            Get-ChildItem `
+              -Path $PatchRoot `
+              -Recurse `
+              -File `
+              -Include *.patch,*.diff |
+            Sort-Object FullName
+          )
+          if ($Patches.Count -eq 0) {
+            throw "No patches found."
+          }
+          foreach ($Patch in $Patches) {
+            Write-Host ""
+            Write-Host "Applying: $($Patch.FullName)"
+            # we gotta validate first :)
+            git apply `
+              --check `
+              --3way `
+              --whitespace=nowarn `
+              --verbose `
+              -- "$($Patch.FullName)"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Patch validation failed: $($Patch.FullName)"
+            }
+            git apply `
+              --3way `
+              --whitespace=nowarn `
+              --verbose `
+              -- "$($Patch.FullName)"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Patch application failed: $($Patch.FullName)"
+            }
+          }
+      - name: Show applied changes
+        shell: pwsh
+        working-directory: ${{ env.CHROMIUM_SRC }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Write-Host "Chromium source changes after patching:"
+          git status --short
+          Write-Host ""
+          Write-Host "Changed files:"
+          git diff --name-only
+      - name: Generate build config
+        shell: pwsh
+        working-directory: ${{ env.CHROMIUM_SRC }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $OutDir = Join-Path $env:CHROMIUM_SRC "out\Release"
+          if (Test-Path $OutDir) {
+            Remove-Item -Recurse -Force $OutDir
+          }
+          New-Item -ItemType Directory -Path $OutDir | Out-Null
+          @"
+          is_debug = false
+          is_component_build = false
+          is_official_build = true
+          target_cpu = "x64"
+          symbol_level = 0
+          blink_symbol_level = 0
+          dcheck_always_on = false
+          enable_nacl = false
+          chrome_pgo_phase = 0
+          use_thin_lto = true
+          use_lld = true
+          "@ | Set-Content -Path (Join-Path $OutDir "args.gn") -Encoding ascii
+          Write-Host "Build arguments:"
+          Get-Content (Join-Path $OutDir "args.gn")
+          gn gen $OutDir
+          if ($LASTEXITCODE -ne 0) {
+            throw "gn gen failed."
+          }
+      - name: Build
+        shell: pwsh
+        working-directory: ${{ env.CHROMIUM_SRC }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          autoninja -C out\Release chrome
+          if ($LASTEXITCODE -ne 0) {
+            throw "Chromium build failed."
+          }
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Chrome = Join-Path $env:BUILD_OUTPUT "chrome.exe"
+          if (-not (Test-Path $Chrome -PathType Leaf)) {
+            throw "Build completed but chrome.exe was not found at $Chrome"
+          }
+          $File = Get-Item $Chrome
+          if ($File.Length -lt 1MB) {
+            throw "chrome.exe is unexpectedly small: $($File.Length) bytes"
+          }
+          Write-Host "Build succeeded."
+          Write-Host "Executable: $($File.FullName)"
+          Write-Host "Size: $([math]::Round($File.Length / 1MB, 2)) MB"
+          Get-FileHash $Chrome -Algorithm SHA256
+      - name: Package it
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PackageDir = Join-Path $env:RUNNER_TEMP "chromium-package"
+          $Zip = Join-Path $env:GITHUB_WORKSPACE "chromium-windows-x64.zip"
+          if (Test-Path $PackageDir) {
+            Remove-Item -Recurse -Force $PackageDir
+          }
+          if (Test-Path $Zip) {
+            Remove-Item -Force $Zip
+          }
+          New-Item -ItemType Directory -Path $PackageDir | Out-Null
+          # we need to include everything
+          Copy-Item `
+            -Path "$env:BUILD_OUTPUT\*" `
+            -Destination $PackageDir `
+            -Recurse `
+            -Force
+          Compress-Archive `
+            -Path "$PackageDir\*" `
+            -DestinationPath $Zip `
+            -CompressionLevel Optimal
+          if (-not (Test-Path $Zip -PathType Leaf)) {
+            throw "Failed to create Chromium package."
+          }
+          $Hash = Get-FileHash $Zip -Algorithm SHA256
+          Write-Host "Package: $Zip"
+          Write-Host "SHA256: $($Hash.Hash)"
+          "CHROMIUM_PACKAGE_SHA256=$($Hash.Hash)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromium-windows-x64-${{ github.sha }}
+          path: chromium-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - name: Write build summary
+        shell: pwsh
+        run: |
+          @"
+          ## hardened_chromium Windows build
+          Commit: `${{ github.sha }}`
+          Artifact: `chromium-windows-x64-${{ github.sha }}`
+          SHA-256: `$env:CHROMIUM_PACKAGE_SHA256`
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
